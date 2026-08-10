@@ -1,0 +1,50 @@
+# Build libasound_module_pcm_inferno.so for OpenWrt x86_64 using the repo's Dockerfile.alpine-alsa
+# - uses Docker to run the repo's alpine builder stage (musl) and copies the built .so out
+# - uploads the .so as a workflow artifact
+name: Build Inferno ALSA plugin (OpenWrt x86_64)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'  # daily at 03:00 UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build libasound_module_pcm_inferno.so (alpine builder)
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          # Build the Docker image using the provided Dockerfile.alpine-alsa.
+          # The builder stage places the compiled .so into /out in the image.
+          docker build --progress=plain -f Dockerfile.alpine-alsa -t inferno-alsa-builder .
+
+          # Create a temporary container and copy the built .so out of it.
+          container_id=$(docker create inferno-alsa-builder)
+          docker cp "${container_id}:/out/libasound_module_pcm_inferno.so" ./libasound_module_pcm_inferno.so || {
+            echo "Failed to copy lib from container; container logs:"
+            docker logs "${container_id}" || true
+            docker rm -v "${container_id}" || true
+            exit 1
+          }
+          docker rm -v "${container_id}" || true
+
+          # Sanity checks
+          echo "Built artifact:"
+          ls -l libasound_module_pcm_inferno.so || true
+          sha256sum libasound_module_pcm_inferno.so || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libasound_module_pcm_inferno-x86_64-openwrt
+          path: libasound_module_pcm_inferno.so
