@@ -1,21 +1,30 @@
-# Build libasound_module_pcm_inferno.so for OpenWrt x86_64 using the repo's Dockerfile.alpine-alsa
-# - uses Docker to run the repo's alpine builder stage (musl) and copies the built .so out
-# - uploads the .so as a workflow artifact
-name: Build Inferno ALSA plugin (OpenWrt x86_64)
+name: Build Inferno ALSA plugin (OpenWrt x86_64, OpenWrt SDK)
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ "main", "master" ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      sdk_url:
+        description: '(optional) full URL to OpenWrt 24.x x86_64 SDK tar.xz (if not provided, workflow will fail and print instructions)'
+        required: false
+      sdk_sha256:
+        description: '(optional) expected sha256 of the SDK tarball, used to verify download'
+        required: false
   schedule:
     - cron: '0 3 * * *'  # daily at 03:00 UTC
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
-  build:
+  docker-builder:
+    name: Docker musl builder (fast feedback)
     runs-on: ubuntu-latest
+    outputs:
+      docker-artifact: ${{ steps.upload.outputs.artifact-url || '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,27 +33,205 @@ jobs:
         env:
           DOCKER_BUILDKIT: 1
         run: |
-          # Build the Docker image using the provided Dockerfile.alpine-alsa.
-          # The builder stage places the compiled .so into /out in the image.
           docker build --progress=plain -f Dockerfile.alpine-alsa -t inferno-alsa-builder .
-
-          # Create a temporary container and copy the built .so out of it.
           container_id=$(docker create inferno-alsa-builder)
           docker cp "${container_id}:/out/libasound_module_pcm_inferno.so" ./libasound_module_pcm_inferno.so || {
-            echo "Failed to copy lib from container; container logs:"
+            echo "Failed to copy lib from container; printing container logs"
             docker logs "${container_id}" || true
             docker rm -v "${container_id}" || true
             exit 1
           }
           docker rm -v "${container_id}" || true
-
-          # Sanity checks
-          echo "Built artifact:"
           ls -l libasound_module_pcm_inferno.so || true
           sha256sum libasound_module_pcm_inferno.so || true
 
-      - name: Upload artifact
+      - name: Upload docker-built artifact
+        id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: libasound_module_pcm_inferno-x86_64-openwrt
+          name: libasound_module_pcm_inferno-x86_64-musl-docker
           path: libasound_module_pcm_inferno.so
+
+  openwrt-sdk-build:
+    name: OpenWrt SDK cross-build (recommended for ABI compatibility)
+    needs: [ docker-builder ]
+    runs-on: ubuntu-latest
+    env:
+      # Optional: set OPENWRT_SDK_URL in repository secrets or pass via workflow_dispatch input
+      OPENWRT_SDK_URL: ${{ github.event.inputs.sdk_url || secrets.OPENWRT_SDK_URL || '' }}
+      OPENWRT_SDK_SHA256: ${{ github.event.inputs.sdk_sha256 || secrets.OPENWRT_SDK_SHA256 || '' }}
+      OPENWRT_TARGET_ARCH: x86/64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate SDK URL is provided
+        id: check_sdk
+        run: |
+          if [ -z "${OPENWRT_SDK_URL:-}" ]; then
+            echo "Error: No OpenWrt SDK URL provided."
+            echo "Provide the SDK URL as workflow input 'sdk_url' (workflow_dispatch) or set secret OPENWRT_SDK_URL."
+            echo ""
+            echo "Example SDK URL pattern (replace exact version):"
+            echo "  https://downloads.openwrt.org/releases/24.06.0/targets/x86/64/openwrt-sdk-24.06.0-x86-64_gcc-12.2.0_musl.Linux-x86_64.tar.xz"
+            exit 1
+          fi
+          echo "SDK URL provided: ${OPENWRT_SDK_URL}"
+          echo "::set-output name=sdk_url::${OPENWRT_SDK_URL}"
+
+      - name: Download OpenWrt SDK
+        run: |
+          SDK_URL="${OPENWRT_SDK_URL}"
+          SDK_TAR="openwrt-sdk.tar.xz"
+          echo "Downloading SDK from ${SDK_URL} ..."
+          curl -fsSL -o "${SDK_TAR}" "${SDK_URL}"
+          if [ -n "${OPENWRT_SDK_SHA256}" ]; then
+            echo "Verifying sha256..."
+            echo "${OPENWRT_SDK_SHA256}  ${SDK_TAR}" > sdk.sha256
+            sha256sum -c sdk.sha256
+          fi
+          echo "Extracting SDK..."
+          mkdir -p openwrt-sdk
+          tar -xJf "${SDK_TAR}" -C openwrt-sdk --strip-components=1
+          ls -la openwrt-sdk | sed -n '1,200p'
+
+      - name: Discover toolchain and staging dir
+        id: discover
+        run: |
+          set -euo pipefail
+          SDK_DIR="$(pwd)/openwrt-sdk"
+          echo "SDK_DIR=${SDK_DIR}" > sdk.env
+          # find staging_dir
+          if [ -d "${SDK_DIR}/staging_dir" ]; then
+            STAGING="${SDK_DIR}/staging_dir"
+          else
+            # some SDK variants use staging_dir/toolchain-*
+            STAGING=$(find "${SDK_DIR}" -maxdepth 2 -type d -name staging_dir -print -quit || true)
+            : ${STAGING:="${SDK_DIR}/staging_dir"}
+          fi
+          echo "STAGING_DIR=${STAGING}" >> sdk.env
+          # find toolchain bin dir (first match)
+          TOOLCHAIN_BIN=$(find "${SDK_DIR}/staging_dir/toolchain-"* -type d -path "*/bin" -print -quit || true)
+          if [ -z "$TOOLCHAIN_BIN" ]; then
+            # fallback: list toolchain directories
+            TOOLCHAIN_DIR=$(ls -d "${SDK_DIR}/staging_dir/toolchain-"* 2>/dev/null | head -n1 || true)
+            TOOLCHAIN_BIN="${TOOLCHAIN_DIR}/bin"
+          fi
+          echo "TOOLCHAIN_BIN=${TOOLCHAIN_BIN}" >> sdk.env
+          echo "Contents of toolchain bin (first 50):"
+          ls -la "${TOOLCHAIN_BIN}" | sed -n '1,200p' || true
+          cat sdk.env
+          echo "::set-output name=staging::${STAGING}"
+          echo "::set-output name=toolchain_bin::${TOOLCHAIN_BIN}"
+
+      - name: Install Rust + target + cargo tools
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install stable || true
+          rustup default stable
+          # add musl target (useful fallback) and native target
+          rustup target add x86_64-unknown-linux-gnu || true
+          rustup target add x86_64-unknown-linux-musl || true
+          cargo --version
+          rustc --version
+
+      - name: Configure cross toolchain env (from SDK)
+        id: envcfg
+        run: |
+          set -euo pipefail
+          source ./sdk.env || true
+          STAGING_DIR="${STAGING_DIR:-$(pwd)/openwrt-sdk/staging_dir}"
+          TOOLCHAIN_BIN="${TOOLCHAIN_BIN:-$(ls -d ${STAGING_DIR}/toolchain-*/*/bin 2>/dev/null | head -n1 || true)}"
+          if [ -z "$TOOLCHAIN_BIN" ] ; then
+            # try alternate path
+            TOOLCHAIN_BIN=$(ls -d "${STAGING_DIR}/toolchain-"*/*/bin 2>/dev/null | head -n1 || true)
+          fi
+          echo "Using STAGING_DIR=$STAGING_DIR"
+          echo "Using TOOLCHAIN_BIN=$TOOLCHAIN_BIN"
+          # attempt to find cross gcc (e.g. x86_64-openwrt-linux-gcc)
+          CROSS_GCC=$(ls "${TOOLCHAIN_BIN}"/*-gcc 2>/dev/null | head -n1 || true)
+          CROSS_AR=$(ls "${TOOLCHAIN_BIN}"/*-ar 2>/dev/null | head -n1 || true)
+          CROSS_RC=$(ls "${TOOLCHAIN_BIN}"/*-strip 2>/dev/null | head -n1 || true)
+          if [ -z "$CROSS_GCC" ] ; then
+            echo "Warning: cross gcc not found in SDK toolchain bin. Listing TOOLCHAIN_BIN contents:"
+            ls -la "${TOOLCHAIN_BIN}" || true
+          else
+            echo "Found CROSS_GCC=$CROSS_GCC"
+          fi
+          # Expose values for later steps
+          echo "CROSS_GCC=${CROSS_GCC}" >> sdk.env
+          echo "CROSS_AR=${CROSS_AR}"   >> sdk.env
+          echo "CROSS_RC=${CROSS_RC}"   >> sdk.env
+          cat sdk.env
+          echo "::set-output name=cross_gcc::${CROSS_GCC:-}"
+          echo "::set-output name=cross_ar::${CROSS_AR:-}"
+
+      - name: Install pkg-config and alsa dev (for build host diagnostics)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pkg-config libasound2-dev gcc musl-tools build-essential
+          pkg-config --version || true
+          arecord --version || true
+
+      - name: Attempt cross-build (using SDK toolchain where available)
+        env:
+          PATH: "${{ steps.discover.outputs.toolchain_bin }}:$PATH"
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          # inform pkg-config to search in SDK staging_dir
+          PKG_CONFIG_SYSROOT_DIR: "${{ steps.discover.outputs.staging }}"
+          PKG_CONFIG_PATH: |
+            ${{ steps.discover.outputs.staging }}/usr/lib/pkgconfig:
+            ${{ steps.discover.outputs.staging }}/usr/lib64/pkgconfig:
+            ${{ steps.discover.outputs.staging }}/usr/share/pkgconfig
+          CC: ${{ steps.discover.outputs.toolchain_bin }}/x86_64-openwrt-linux-gcc || true
+          AR: ${{ steps.discover.outputs.toolchain_bin }}/x86_64-openwrt-linux-ar || true
+        run: |
+          set -euo pipefail
+          export PATH="${{ steps.discover.outputs.toolchain_bin }}:$PATH"
+          # Show environment for debugging
+          echo "PATH=${PATH}"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+          echo "PKG_CONFIG_SYSROOT_DIR=$PKG_CONFIG_SYSROOT_DIR"
+          echo "Trying to detect alsa via pkg-config (from SDK staging_dir):"
+          env PKG_CONFIG_PATH="$PKG_CONFIG_PATH" pkg-config --modversion alsa || true
+          # Build the specific crate (alsa_pcm_inferno). We attempt build for x86_64-unknown-linux-gnu first,
+          # but actual linking will depend on presence of headers/libs in SDK staging_dir.
+          export CARGO_TARGET_DIR="$(pwd)/target-openwrt"
+          cargo build --release -p alsa_pcm_inferno || {
+            echo "cargo build failed. Capturing verbose build output for diagnostics:"
+            RUST_BACKTRACE=1 cargo build --release -p alsa_pcm_inferno -v || true
+            echo "Listing staging_dir/lib and include to verify presence of alsa headers:"
+            ls -la "${{ steps.discover.outputs.staging }}/usr/include" || true
+            ls -la "${{ steps.discover.outputs.staging }}/usr/lib" || true
+            exit 1
+          }
+          echo "cargo build succeeded - locating produced .so"
+          # The crate builds a cdylib; find it
+          find target-openwrt -type f -name "libasound_module_pcm_inferno*.so" -print -exec ls -l {} \; || true
+          # If cargo placed built artifacts into target dir matching default, check there too
+          find target -type f -name "libasound_module_pcm_inferno*.so" -print -exec ls -l {} \; || true
+          # Copy the .so to workspace root to upload
+          SOFILE=$(find . -type f -name "libasound_module_pcm_inferno*.so" | head -n1 || true)
+          if [ -z "$SOFILE" ]; then
+            echo "ERROR: compiled .so not found; build may have produced a different output. Listing target directories:"
+            find target* -maxdepth 3 -type f -name "*.so" -print -exec ls -l {} \; || true
+            exit 1
+          fi
+          cp -v "$SOFILE" ./libasound_module_pcm_inferno-openwrt.so
+          echo "Produced: $(ls -l libasound_module_pcm_inferno-openwrt.so)"
+
+      - name: Upload OpenWrt SDK-built artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libasound_module_pcm_inferno-x86_64-openwrt-sdk
+          path: libasound_module_pcm_inferno-openwrt.so
+
+      - name: Diagnostic listing (staging_dir content head)
+        if: failure() || always()
+        run: |
+          echo "STAGING_DIR contents (top level):"
+          ls -la openwrt-sdk/staging_dir || true
+          echo "Toolchain bin (first 200 entries):"
+          ls -la ${{ steps.discover.outputs.toolchain_bin }} | sed -n '1,200p' || true
+          echo "If build failed, consider ensuring alsa headers/libraries exist in SDK staging_dir or building a native OpenWrt package Makefile."
