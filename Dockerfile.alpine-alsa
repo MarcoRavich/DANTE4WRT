@@ -1,5 +1,33 @@
 FROM alpine:latest
 
+# Install build dependencies including git
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    make \
+    alsa-lib-dev \
+    curl \
+    git \
+    cargo \
+    openssh-client \
+    ca-certificates
+
+# Set up working directory
+WORKDIR /build
+
+# Copy repository files
+COPY . .
+
+# Build the ALSA PCM Inferno plugin
+RUN cargo build --release -p alsa_pcm_inferno --manifest-path ./alsa_pcm_inferno/Cargo.toml
+
+# Prepare output directory
+RUN mkdir -p /out && \
+    cp target/release/libasound_module_pcm_inferno.so /out/ || \
+    find target -name "libasound_module_pcm_inferno*.so" -exec cp {} /out/ \;
+
+CMD ["/bin/sh"]FROM alpine:latest
+
 # Install build dependencies
 RUN apk add --no-cache \
     gcc \
