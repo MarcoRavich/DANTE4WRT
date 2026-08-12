@@ -31,10 +31,12 @@ jobs:
         
       - name: Fetch Inferno files from teodly/inferno
         run: |
-          # Download asoundrc from teodly/inferno
-          mkdir -p alsa_pcm_inferno
-          curl -fsSL -o alsa_pcm_inferno/asoundrc https://raw.githubusercontent.com/teodly/inferno/dev/alsa_pcm_inferno/asoundrc
-          echo "Downloaded asoundrc from teodly/inferno"
+          rm -rf alsa_pcm_inferno
+          # Clone the dev branch of teodly/inferno and extract the alsa_pcm_inferno directory
+          git clone --depth 1 --branch dev https://github.com/teodly/inferno.git /tmp/inferno
+          mv /tmp/inferno/alsa_pcm_inferno .
+          rm -rf /tmp/inferno
+          echo "Downloaded alsa_pcm_inferno from teodly/inferno"
           ls -la alsa_pcm_inferno/
 
       - name: Build libasound_module_pcm_inferno.so (alpine builder)
