@@ -17,7 +17,7 @@ WORKDIR /build
 COPY . .
 
 # Build the ALSA PCM Inferno plugin
-RUN cargo build --release -p alsa_pcm_inferno --manifest-path ./alsa_pcm_inferno/Cargo.toml
+RUN cargo build --release -p alsa_pcm_inferno --manifest-path /alsa_pcm_inferno/Cargo.toml
 
 # Prepare output directory
 RUN mkdir -p /out && \
