@@ -15,7 +15,7 @@ RUN apk add --no-cache \
 # Set up working directory
 WORKDIR /build
 
-# Copy repository files
+# Copy all repository files including subdependencies
 COPY . .
 
 # Build the ALSA PCM Inferno plugin
