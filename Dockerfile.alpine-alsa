@@ -1,0 +1,31 @@
+FROM alpine:latest
+
+# Install build dependencies
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    make \
+    alsa-lib-dev \
+    curl \
+    git \
+    rustup \
+    cargo
+
+# Install Rust
+RUN rustup-init -y
+
+# Set up working directory
+WORKDIR /build
+
+# Copy repository files
+COPY . .
+
+# Build the ALSA PCM Inferno plugin
+RUN cargo build --release -p alsa_pcm_inferno
+
+# Prepare output directory
+RUN mkdir -p /out && \
+    cp target/release/libasound_module_pcm_inferno.so /out/ || \
+    find target -name "libasound_module_pcm_inferno*.so" -exec cp {} /out/ \;
+
+CMD ["/bin/sh"]
