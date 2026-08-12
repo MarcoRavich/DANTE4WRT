@@ -8,11 +8,7 @@ RUN apk add --no-cache \
     alsa-lib-dev \
     curl \
     git \
-    rustup \
     cargo
-
-# Install Rust
-RUN rustup-init -y
 
 # Set up working directory
 WORKDIR /build
