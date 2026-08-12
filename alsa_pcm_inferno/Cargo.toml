@@ -1,2 +1,7 @@
-[workspace]
-members = ["alsa_pcm_inferno"]
+[package]
+name = "alsa_pcm_inferno"
+version = "0.5.0"
+edition = "2021"
+
+[dependencies]
+alsa-sys-all = { git = "https://gitlab.com/lumifaza/alsa-sys-all" }
