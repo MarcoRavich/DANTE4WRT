@@ -1,0 +1,244 @@
+name: Build Inferno2pipe for OpenWrt 24.10
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: OpenWrt release in the 24.10.x series
+        required: true
+        default: "24.10.7"
+        type: string
+      target:
+        description: OpenWrt target directory, for example x86 or ath79
+        required: true
+        default: x86
+        type: string
+      subtarget:
+        description: OpenWrt subtarget directory, for example 64 or generic
+        required: true
+        default: "64"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inferno2pipe-${{ github.ref }}-${{ inputs.openwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+  cancel-in-progress: false
+
+env:
+  INFERNO_VERSION: "0.5.4"
+  INFERNO_COMMIT: 04c0efe05aff5e3c90a22160c7f2da24160c3293
+
+jobs:
+  build:
+    name: ${{ inputs.openwrt_version }} ${{ inputs.target }}/${{ inputs.subtarget }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      OPENWRT_VERSION: ${{ inputs.openwrt_version }}
+      OPENWRT_TARGET: ${{ inputs.target }}
+      OPENWRT_SUBTARGET: ${{ inputs.subtarget }}
+
+    steps:
+      - name: Check out package feed
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate workflow inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${OPENWRT_VERSION}" =~ ^24\.10\.[0-9]+$ ]]; then
+            echo "::error::openwrt_version must have the form 24.10.N"
+            exit 2
+          fi
+
+          for value in "${OPENWRT_TARGET}" "${OPENWRT_SUBTARGET}"; do
+            if [[ ! "${value}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+              echo "::error::target and subtarget may contain only lowercase letters, digits, dot, underscore and hyphen"
+              exit 2
+            fi
+          done
+
+      - name: Check out pinned Inferno source and submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: teodly/inferno
+          ref: ${{ env.INFERNO_COMMIT }}
+          path: inferno2pipe/src
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify Inferno source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          actual_commit="$(git -C inferno2pipe/src rev-parse HEAD)"
+          if [[ "${actual_commit}" != "${INFERNO_COMMIT}" ]]; then
+            echo "::error::Inferno checkout mismatch: ${actual_commit}"
+            exit 1
+          fi
+
+          submodule_state="$(git -C inferno2pipe/src submodule status --recursive)"
+          printf '%s\n' "${submodule_state}"
+          if grep -Eq '^[+-U]' <<<"${submodule_state}"; then
+            echo "::error::At least one Inferno submodule is missing or at the wrong revision"
+            exit 1
+          fi
+
+      - name: Install SDK host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            bzip2 \
+            file \
+            gawk \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            patch \
+            python3 \
+            rsync \
+            unzip \
+            wget \
+            zstd
+
+      - name: Download and verify the official OpenWrt SDK
+        id: sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${OPENWRT_TARGET}/${OPENWRT_SUBTARGET}"
+          download_dir="${RUNNER_TEMP}/openwrt-download"
+          mkdir -p "${download_dir}"
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            --silent --show-error \
+            --output "${download_dir}/sha256sums" \
+            "${base_url}/sha256sums"
+
+          mapfile -t sdk_records < <(
+            grep -E '^[0-9a-f]{64} \*openwrt-sdk-.*\.Linux-x86_64\.tar\.zst$' \
+              "${download_dir}/sha256sums"
+          )
+
+          if (( ${#sdk_records[@]} != 1 )); then
+            echo "::error::Expected exactly one Linux x86_64 SDK in ${base_url}"
+            exit 1
+          fi
+
+          read -r sdk_sha256 sdk_marked_file <<<"${sdk_records[0]}"
+          sdk_file="${sdk_marked_file#\*}"
+          expected_prefix="openwrt-sdk-${OPENWRT_VERSION}-${OPENWRT_TARGET}-${OPENWRT_SUBTARGET}_"
+
+          if [[ "${sdk_file}" != "${expected_prefix}"*.Linux-x86_64.tar.zst ]]; then
+            echo "::error::Unexpected SDK filename: ${sdk_file}"
+            exit 1
+          fi
+
+          sdk_archive="${download_dir}/${sdk_file}"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --silent --show-error \
+            --output "${sdk_archive}" \
+            "${base_url}/${sdk_file}"
+
+          printf '%s *%s\n' "${sdk_sha256}" "${sdk_archive}" | \
+            sha256sum --check --strict -
+
+          sdk_dir="${RUNNER_TEMP}/openwrt-sdk"
+          mkdir -p "${sdk_dir}"
+          tar --zstd --extract --file "${sdk_archive}" \
+            --no-same-owner --strip-components=1 --directory "${sdk_dir}"
+
+          printf 'dir=%s\n' "${sdk_dir}" >>"${GITHUB_OUTPUT}"
+          printf 'filename=%s\n' "${sdk_file}" >>"${GITHUB_OUTPUT}"
+          printf 'sha256=%s\n' "${sdk_sha256}" >>"${GITHUB_OUTPUT}"
+
+      - name: Configure OpenWrt feeds
+        working-directory: ${{ steps.sdk.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+
+          cp feeds.conf.default feeds.conf
+          printf '\nsrc-link inferno %s\n' "${GITHUB_WORKSPACE}" >>feeds.conf
+
+          ./scripts/feeds update packages inferno
+          ./scripts/feeds install -p packages -f rust
+          ./scripts/feeds install -p inferno -f inferno2pipe
+          make defconfig
+          make prereq
+
+      - name: Build the Inferno2pipe IPK
+        working-directory: ${{ steps.sdk.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          make -j"$(nproc)" package/inferno2pipe/compile V=s BUILD_LOG=1
+
+      - name: Collect package and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdk_dir="${{ steps.sdk.outputs.dir }}"
+          mkdir -p dist
+          mapfile -t packages < <(
+            find "${sdk_dir}/bin/packages" -type f \
+              -name 'inferno2pipe_*.ipk' -print | sort
+          )
+
+          if (( ${#packages[@]} != 1 )); then
+            echo "::error::Expected exactly one Inferno2pipe IPK, found ${#packages[@]}"
+            exit 1
+          fi
+
+          cp -- "${packages[0]}" dist/
+          (
+            printf 'openwrt_version=%s\n' "${OPENWRT_VERSION}"
+            printf 'openwrt_target=%s\n' "${OPENWRT_TARGET}"
+            printf 'openwrt_subtarget=%s\n' "${OPENWRT_SUBTARGET}"
+            printf 'openwrt_sdk=%s\n' "${{ steps.sdk.outputs.filename }}"
+            printf 'openwrt_sdk_sha256=%s\n' "${{ steps.sdk.outputs.sha256 }}"
+            printf 'inferno_version=%s\n' "${INFERNO_VERSION}"
+            printf 'inferno_commit=%s\n' "${INFERNO_COMMIT}"
+            printf 'workflow_repository=%s\n' "${GITHUB_REPOSITORY}"
+            printf 'workflow_commit=%s\n' "${GITHUB_SHA}"
+            printf '\n[submodules]\n'
+            git -C inferno2pipe/src submodule status --recursive
+          ) >dist/BUILDINFO.txt
+
+          (
+            cd dist
+            sha256sum -- *.ipk >SHA256SUMS
+          )
+
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: inferno2pipe-openwrt-${{ inputs.openwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload build logs after a failure
+        if: ${{ failure() && steps.sdk.outputs.dir != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: inferno2pipe-logs-${{ inputs.openwrt_version }}-${{ inputs.target }}-${{ inputs.subtarget }}
+          path: ${{ steps.sdk.outputs.dir }}/logs/
+          if-no-files-found: ignore
+          retention-days: 14
