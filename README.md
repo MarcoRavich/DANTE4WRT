@@ -1,3 +1,5 @@
+<img src="https://github.com/user-attachments/assets/4313b6fc-50c4-4b73-bc7e-6ac6a48fcd1a" />
+
 Inferno2pipe per OpenWrt 24.10 con GitHub Actions
 
 Scopo
