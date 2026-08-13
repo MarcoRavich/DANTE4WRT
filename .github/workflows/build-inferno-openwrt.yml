@@ -1,4 +1,4 @@
-name: Inferno2pipe for OpenWrt "${OPENWRT_VERSION}" "${OPENWRT_TARGET}"/"${OPENWRT_SUBTARGET}"
+name: Inferno2pipe for OpenWrt 24.10.x
 
 on:
   workflow_dispatch:
